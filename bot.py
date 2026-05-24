@@ -46,113 +46,165 @@ class ChorchaQuizBot:
         self.question_count = 0
         self.streak_captured = False
         self.streak_image_path = None
+        self.collected_screenshots = []
 
-    def send_telegram_payload(self, success: bool, error_msg: str = None, traceback_str: str = None):
-        """Assembles and dispatches a unified text alert to Telegram securely."""
-        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+    def send_telegram_report(self, success: bool, error_msg: str = None, traceback_str: str = None):
+        """Assembles all collected screenshots and metadata, and dispatches a single media group or text message to Telegram."""
         subject_esc = html.escape(self.selected_subject)
         chapter_esc = html.escape(self.selected_chapter)
         
-        # Status Card Title
-        status_header = "✅ <b>Chorcha Bot: Practice Completed</b>\n\n" if success else "❌ <b>Chorcha Bot: Exception Triggered</b>\n\n"
+        is_cookie_expired = error_msg and "COOKIE_EXPIRED" in error_msg
         
-        # Meta Metrics
+        if is_cookie_expired:
+            status_header = "⚠️ <b>Chorcha Bot: Cookie Expired / Login Issue!</b>\n\n"
+        else:
+            status_header = "✅ <b>Chorcha Bot: Practice Completed</b>\n\n" if success else "❌ <b>Chorcha Bot: Exception Triggered</b>\n\n"
+        
         details_part = (
             f"<b>Subject:</b> {subject_esc}\n"
             f"<b>Chapter:</b> {chapter_esc}\n"
             f"<b>Total Answered:</b> {self.question_count} Questions\n"
-            f"<b>Streak Captured:</b> {'Yes 🔥' if self.streak_captured else 'No ⚠️'}\n\n"
+            f"<b>Streak Captured:</b> {'Yes [HOT]' if self.streak_captured else 'No [WARN]'}\n\n"
         )
         
-        # Context Parsing
+        # Build a compact solutions representation to fit caption limits
         if success:
-            ans_json = json.dumps(self.decoded_answers_text, indent=4, ensure_ascii=False)
-            if len(ans_json) > 1200:
-                ans_json = ans_json[:1100] + "\n...[Answers Data Truncated]..."
-            payload_section = f"<b>Decoded Solutions Grid:</b>\n<pre>{html.escape(ans_json)}</pre>\n\n"
+            compact_ans = ", ".join([f"Q{q}:{ans}" for q, ans in self.decoded_answers_text.items()])
+            if len(compact_ans) > 200:
+                compact_ans = compact_ans[:190] + "..."
+            payload_section = f"<b>Solutions:</b> <code>{html.escape(compact_ans)}</code>\n\n"
+        elif is_cookie_expired:
+            payload_section = (
+                "<b>Status:</b> The bot was redirected to the login/registration page.\n"
+                "<b>Action Required:</b> Please update the <code>auth.json</code> file with active session cookies.\n\n"
+            )
         else:
             err_esc = html.escape(str(error_msg or 'Fatal Native Interruption'))
             tb_formatted = traceback_str or 'Traceback footprint unavailable.'
-            if len(tb_formatted) > 1200:
-                tb_formatted = tb_formatted[:1100] + "\n...[Stack-trace Truncated]..."
-            payload_section = f"<b>Error Stack:</b> <code>{err_esc}</code>\n\n<b>Traceback:</b>\n<pre>{html.escape(tb_formatted)}</pre>\n\n"
+            if len(tb_formatted) > 200:
+                tb_formatted = tb_formatted[:190] + "..."
+            payload_section = f"<b>Error:</b> <code>{err_esc}</code>\n<b>Traceback:</b> <code>{html.escape(tb_formatted)}</code>\n\n"
 
-        # Safe Space Engine Allocation for Activity Logs
+        # Get logs and slice the last 8 lines
         logs_accumulated = logger.get_log_string()
-        base_overhead = len(status_header) + len(details_part) + len(payload_section) + len("📋 <b>Activity Pipeline:</b>\n<pre></pre>")
-        usable_buffer = 4096 - base_overhead - 100  # Safe margins for encoding inflation
+        log_lines = [line for line in logs_accumulated.split("\n") if line.strip()]
+        short_logs = "\n".join(log_lines[-8:])
+        if len(short_logs) > 400:
+            short_logs = "...[Logs Truncated]...\n" + short_logs[-380:]
         
-        if len(logs_accumulated) > usable_buffer:
-            logs_accumulated = "[...Timeline Truncated...]\n" + logs_accumulated[-max(300, usable_buffer):]
-            
+        # Combine all parts
         message_body = (
             f"{status_header}"
             f"{details_part}"
             f"{payload_section}"
-            f"📋 <b>Activity Pipeline:</b>\n<pre>{html.escape(logs_accumulated)}</pre>"
+            f"📋 <b>Pipeline Logs:</b>\n<pre>{html.escape(short_logs)}</pre>"
         )
 
+        # Collect paths of existing screenshots
+        valid_photos = []
+        for path, desc in self.collected_screenshots:
+            if path and os.path.exists(path):
+                valid_photos.append(path)
+
+        if valid_photos:
+            # Send as sendMediaGroup
+            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMediaGroup"
+            import uuid
+            boundary = f"MultipartBoundary-{uuid.uuid4().hex}"
+            
+            # Prepare the media parameter
+            media_items = []
+            for i, photo_path in enumerate(valid_photos):
+                item = {
+                    "type": "photo",
+                    "media": f"attach://photo{i}"
+                }
+                # Put the caption on the first photo of the group
+                if i == 0:
+                    item["caption"] = message_body
+                    item["parse_mode"] = "HTML"
+                media_items.append(item)
+            
+            payload_parts = [
+                b'--' + boundary.encode('utf-8'),
+                b'Content-Disposition: form-data; name="chat_id"',
+                b'',
+                self.chat_id.encode('utf-8'),
+                b'--' + boundary.encode('utf-8'),
+                b'Content-Disposition: form-data; name="media"',
+                b'',
+                json.dumps(media_items).encode('utf-8')
+            ]
+            
+            # Add files to the multipart body
+            for i, photo_path in enumerate(valid_photos):
+                payload_parts.extend([
+                    b'--' + boundary.encode('utf-8'),
+                    f'Content-Disposition: form-data; name="photo{i}"; filename="{os.path.basename(photo_path)}"'.encode('utf-8'),
+                    b'Content-Type: image/png',
+                    b''
+                ])
+                with open(photo_path, 'rb') as img_file:
+                    payload_parts.append(img_file.read())
+            
+            payload_parts.append(b'--' + boundary.encode('utf-8') + b'--')
+            payload_parts.append(b'')
+            body = b'\r\n'.join(payload_parts)
+            
+            req = urllib.request.Request(
+                url, data=body,
+                headers={
+                    'Content-Type': f'multipart/form-data; boundary={boundary}',
+                    'Content-Length': str(len(body)),
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+                }
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=45) as response:
+                    logger.info("Successfully dispatched unified media group report to Telegram.")
+                    return response.read()
+            except urllib.error.HTTPError as he:
+                try:
+                    err_resp = he.read().decode()
+                    logger.info(f"Failed dispatching media group: HTTP Error {he.code}: {err_resp}. Falling back...")
+                except:
+                    logger.info(f"Failed dispatching media group: HTTP Error {he.code}. Falling back...")
+            except Exception as ex:
+                logger.info(f"Failed dispatching media group: {ex}. Falling back to standard message...")
+        
+        # Fallback to sendMessage if no photos or sendMediaGroup failed
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+        full_logs = logs_accumulated
+        if len(full_logs) > 2000:
+            full_logs = "[...]\n" + full_logs[-1800:]
+            
+        full_ans_json = json.dumps(self.decoded_answers_text, indent=4, ensure_ascii=False)
+        if len(full_ans_json) > 1000:
+            full_ans_json = full_ans_json[:900] + "\n..."
+            
+        fallback_body = (
+            f"{status_header}"
+            f"{details_part}"
+            f"<b>Solutions:</b>\n<pre>{html.escape(full_ans_json)}</pre>\n\n"
+            f"📋 <b>Pipeline Logs:</b>\n<pre>{html.escape(full_logs)}</pre>"
+        )
+        
+        if len(fallback_body) > 4000:
+            fallback_body = fallback_body[:3900] + "\n...[Truncated]..."
+            
         data = urllib.parse.urlencode({
             "chat_id": self.chat_id,
-            "text": message_body,
+            "text": fallback_body,
             "parse_mode": "HTML"
         }).encode("utf-8")
         
         try:
-            req = urllib.request.Request(url, data=data, headers={"User-Agent": "ChorchaAutomationEngine/2.0"})
+            req = urllib.request.Request(url, data=data, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"})
             with urllib.request.urlopen(req, timeout=15) as response:
+                logger.info("Successfully dispatched fallback text report to Telegram.")
                 return response.read()
         except Exception as ex:
-            print(f"CRITICAL: Failed dispatching Telegram system log message: {ex}")
-
-    def send_telegram_photo(self, photo_path: str, caption: str):
-        """Dispatches an isolated high-priority visual multi-part form media packet."""
-        if not photo_path or not os.path.exists(photo_path):
-            return
-            
-        url = f"https://api.telegram.org/bot{self.telegram_token}/sendPhoto"
-        import uuid
-        boundary = f"MultipartBoundary-{uuid.uuid4().hex}"
-        
-        payload_parts = [
-            b'--' + boundary.encode('utf-8'),
-            b'Content-Disposition: form-data; name="chat_id"',
-            b'',
-            self.chat_id.encode('utf-8'),
-            b'--' + boundary.encode('utf-8'),
-            b'Content-Disposition: form-data; name="caption"',
-            b'',
-            caption.encode('utf-8'),
-            b'--' + boundary.encode('utf-8'),
-            b'Content-Disposition: form-data; name="parse_mode"',
-            b'',
-            b'HTML',
-            b'--' + boundary.encode('utf-8'),
-            f'Content-Disposition: form-data; name="photo"; filename="{os.path.basename(photo_path)}"'.encode('utf-8'),
-            b'Content-Type: image/png',
-            b''
-        ]
-        
-        with open(photo_path, 'rb') as img_file:
-            payload_parts.append(img_file.read())
-            
-        payload_parts.append(b'--' + boundary.encode('utf-8') + b'--')
-        payload_parts.append(b'')
-        body = b'\r\n'.join(payload_parts)
-        
-        req = urllib.request.Request(
-            url, data=body,
-            headers={
-                'Content-Type': f'multipart/form-data; boundary={boundary}',
-                'Content-Length': str(len(body)),
-                'User-Agent': 'ChorchaAutomationEngine/2.0'
-            }
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                return response.read()
-        except Exception as ex:
-            print(f"CRITICAL: Failed dispatching multi-part binary snapshot: {ex}")
+            print(f"CRITICAL: Failed dispatching Telegram fallback message: {ex}")
 
     @staticmethod
     def decode_string(encoded_str: str, key: str) -> str:
@@ -224,16 +276,17 @@ class ChorchaQuizBot:
             return False
 
     def capture_dashboard_streak(self, page: Page):
-        """Navigates to the homepage, safely triggers, captures, and handles the streak dialog."""
+        """Navigates to the homepage, captures dashboard screenshot, and handles the streak dialog if present."""
         logger.info("Transitioning to main application home view for performance indexing verification...")
         try:
             # Force navigation to dashboard explicitly
-            page.goto("https://chorcha.net/", wait_until="commit", timeout=20000)
-            try:
-                page.locator(".text-sm.py-1.px-3.cursor-pointer, [class*='text-sm py-1 px-3 cursor-pointer'], footer, header").first.wait_for(state="visible", timeout=10000)
-            except:
-                pass
-            page.wait_for_timeout(2500)  # Allow client hydration architecture to stabilize safely
+            page.goto("https://chorcha.net/", wait_until="networkidle", timeout=25000)
+            page.wait_for_timeout(3000)  # Allow client hydration architecture to stabilize safely
+            
+            # Mandatory Dashboard View Screenshot Capture
+            homepage_screenshot = f"homepage_snapshot_{int(time.time())}.png"
+            page.screenshot(path=homepage_screenshot)
+            self.collected_screenshots.append((homepage_screenshot, "Dashboard Homepage"))
             
             streak_selector = ".text-sm.py-1.px-3.cursor-pointer, [class*='text-sm py-1 px-3 cursor-pointer']"
             streak_target = page.locator(streak_selector).first
@@ -249,12 +302,7 @@ class ChorchaQuizBot:
                 page.screenshot(path=self.streak_image_path)
                 self.streak_captured = True
                 logger.info(f"Local binary context saved: '{self.streak_image_path}'")
-                
-                # Immediate visual dispatch tracking loop
-                self.send_telegram_photo(
-                    self.streak_image_path, 
-                    f"🔥 <b>Chorcha System Status: Streak Track Verification Verified!</b>\nSubject Context: {html.escape(self.selected_subject)}"
-                )
+                self.collected_screenshots.append((self.streak_image_path, "Streak Metric"))
                 
                 # Cleanup viewport overlay manually to keep terminal fluid
                 page.keyboard.press("Escape")
@@ -280,6 +328,7 @@ class ChorchaQuizBot:
             )
             
             context_args = {"viewport": {"width": 1280, "height": 800}} if headless_mode else {"no_viewport": True}
+            context_args["user_agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             context = browser.new_context(**context_args)
             
             self.push_auth_cookies(context)
@@ -300,21 +349,20 @@ class ChorchaQuizBot:
                 
                 try:
                     page.goto("https://chorcha.net/practice-exam", wait_until="commit", timeout=20000)
+                    if "auth/register" in page.url or "register" in page.url or "login" in page.url:
+                        raise RuntimeError("COOKIE_EXPIRED: Chorcha auth cookie has expired or login issue detected.")
                     target_selector = 'main h3, button:has-text("লগইন"), button:has-text("Login"), a:has-text("লগইন"), a:has-text("Login")'
                     page.locator(target_selector).first.wait_for(state="visible", timeout=20000)
                 except Exception as ex:
+                    if "COOKIE_EXPIRED" in str(ex):
+                        raise ex
                     logger.info(f"Primary routing process failed due to latency constraints: {ex}. Recalibrating tracking matrix line...")
                     continue
                 
                 # Runtime Login Validation Gate
                 login_indicator = page.locator('text="লগইন", text="Login"').first
-                if login_indicator.is_visible():
-                    if headless_mode:
-                        raise RuntimeError("Context execution breakdown: Credentials mismatch detected inside virtual terminal runtime window.")
-                    logger.info("User prompt required: Authorization state expired. Awaiting synchronization manual confirmation locks...")
-                    while login_indicator.is_visible():
-                        page.wait_for_timeout(1000)
-                    page.wait_for_timeout(2000)
+                if login_indicator.is_visible() or "auth/register" in page.url or "register" in page.url or "login" in page.url:
+                    raise RuntimeError("COOKIE_EXPIRED: Chorcha auth cookie has expired or login issue detected.")
                 
                 # Subject Extraction Routines
                 subject_headers = page.locator('main h3')
@@ -426,6 +474,8 @@ class ChorchaQuizBot:
                         logger.info("Internal tracking validation metrics failure: Intercept keys mismatch.")
                         failed_chapters.add((self.selected_subject, self.selected_chapter))
                 except Exception as ex:
+                    if "auth/register" in page.url or "register" in page.url or "login" in page.url or page.locator('text="লগইন", text="Login"').first.is_visible():
+                        raise RuntimeError("COOKIE_EXPIRED: Chorcha auth cookie has expired or login issue detected.")
                     logger.info(f"System execution bottleneck matching targets: {ex}")
                     failed_chapters.add((self.selected_subject, self.selected_chapter))
             
@@ -487,42 +537,54 @@ class ChorchaQuizBot:
             try:
                 metrics_screenshot_file = f"metrics_checkpoint_{int(time.time())}.png"
                 page.screenshot(path=metrics_screenshot_file)
-                self.send_telegram_photo(metrics_screenshot_file, f"📊 <b>Chorcha Core System Session Checkpoint Metrics Frame Saved</b>")
+                self.collected_screenshots.append((metrics_screenshot_file, "Metrics Checkpoint"))
             except: pass
             
-            # Review Screen Checking Sequence Block
-            error_review_trigger = page.locator('button:has-text("ভুলগুলো রিভিউ করো")')
-            if error_review_trigger.is_visible():
-                logger.info("Located operational error correction assessment arrays block link item. Running sanity trace index paths...")
-                try:
-                    error_review_trigger.click()
-                    page.wait_for_timeout(2000)
-                    review_view_screenshot = f"error_review_checkpoint_{int(time.time())}.png"
-                    page.screenshot(path=review_view_screenshot)
-                    self.send_telegram_photo(review_view_screenshot, f"🔍 <b>Error Analysis Layer Context Saved For Processing Run</b>")
-                    page.go_back()
-                    page.wait_for_load_state("domcontentloaded")
-                    page.wait_for_timeout(1000)
-                except Exception as ex:
-                    logger.info(f"Bypassed non-blocking inspection failure loop exception rules safely: {ex}")
-
             # Safe Pipeline Closure Processing Intersect Hooks
-            skip_action_element = page.locator('button:has-text("স্কিপ করো")')
-            advance_action_element = page.locator('button:has-text("এগিয়ে যাও")')
+            logger.info("Waiting for closing actions ('স্কিপ করো' / 'এগিয়ে যাও') to appear...")
             
+            skip_action_element = page.locator('button:has-text("স্কিপ করো"), button:has-text("স্কিপ কর")')
+            
+            # Dynamic Wait for skip button to prevent missing elements
+            try:
+                skip_action_element.wait_for(state="visible", timeout=5000)
+            except:
+                logger.info("'স্কিপ করো' button was not visible within time limits.")
+                
             if skip_action_element.is_visible():
                 try:
+                    logger.info("Clicking 'স্কিপ করো' button.")
                     skip_action_element.scroll_into_view_if_needed()
                     skip_action_element.click()
-                    advance_action_element.wait_for(state="visible", timeout=4000)
-                except: pass
+                    logger.info("Clicked 'স্কিপ করো' button. Waiting 3 seconds for next step to load...")
+                    page.wait_for_timeout(3000)
+                except Exception as e:
+                    logger.info(f"Execution handling exception on skip action click: {e}")
                 
-            if advance_action_element.is_visible():
+            # Click 'এগিয়ে যাও' / 'এগিয়ে যাও' in a loop to handle multiple transition/leaderboard screens
+            logger.info("Starting loop to click advance button ('এগিয়ে যাও' / 'এগিয়ে যাও') if visible...")
+            
+            for i in range(5):
+                advance_action_element = page.locator('button:has-text("এগিয়ে যাও"), button:has-text("এগিয়ে যাও")')
+                
                 try:
-                    advance_action_element.scroll_into_view_if_needed()
-                    advance_action_element.click()
-                    page.wait_for_timeout(1500)
-                except: pass
+                    advance_action_element.first.wait_for(state="visible", timeout=3000)
+                except:
+                    logger.info(f"Iteration {i+1}: 'এগিয়ে যাও' button not visible.")
+                    break
+                    
+                if advance_action_element.first.is_visible():
+                    try:
+                        logger.info(f"Iteration {i+1}: Clicking 'এগিয়ে যাও' button.")
+                        advance_action_element.first.scroll_into_view_if_needed()
+                        advance_action_element.first.click()
+                        logger.info("Clicked 'এগিয়ে যাও' button. Waiting 2 seconds for next screen...")
+                        page.wait_for_timeout(2000)
+                    except Exception as e:
+                        logger.info(f"Execution handling exception on advance action click: {e}")
+                        break
+                else:
+                    break
             
             # RUNTIME EXTENSION: Perform Homepage Streak Collection Validation Routines Before Ending System Engine
             self.capture_dashboard_streak(page)
@@ -532,7 +594,7 @@ class ChorchaQuizBot:
             browser.close()
             
             # Transmit success report array block packet safely out
-            self.send_telegram_payload(success=True)
+            self.send_telegram_report(success=True)
 
     def run(self):
         try:
@@ -540,10 +602,10 @@ class ChorchaQuizBot:
         except BaseException as ex:
             error_traceback_str = traceback.format_exc()
             logger.info(f"CRITICAL FAULT: Pipeline structural flow sequence broke down under constraint processing rules: {ex}")
-            print(error_traceback_str)
+            logger.info(error_traceback_str)
             
             # Dispatch structural alert fail state data traces
-            self.send_telegram_payload(success=False, error_msg=str(ex), traceback_str=error_traceback_str)
+            self.send_telegram_report(success=False, error_msg=str(ex), traceback_str=error_traceback_str)
             raise ex
 
 
