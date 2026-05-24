@@ -39,7 +39,7 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
-        python -u gbot.py
+        python -u bot.py
 
     - name: Upload Diagnostic Screenshots
       if: always()
